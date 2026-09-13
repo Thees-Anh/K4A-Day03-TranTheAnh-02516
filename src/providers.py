@@ -6,6 +6,8 @@ Hỗ trợ Native Tool Calling và chuyển đổi linh hoạt qua biến môi t
 import os
 import sys
 import json
+import re
+import time
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 
@@ -36,21 +38,34 @@ class MockOfflineProvider(BaseLLMProvider):
 
     def generate_with_tools(self, prompt: str, tools_schema: List[Dict[str, Any]], system_prompt: str = "") -> Dict[str, Any]:
         prompt_lower = prompt.lower()
+        student_match = re.search(r"\bSV\d+\b", prompt, re.IGNORECASE)
+        student_id = student_match.group(0).upper() if student_match else "SV2026001"
+        datetime_match = re.search(r"\b\d{1,2}:\d{2}(?:\s+(?:ngày\s+)?)?\d{1,2}/\d{1,2}/\d{4}\b", prompt, re.IGNORECASE)
+        datetime_str = datetime_match.group(0).replace("ngày ", "") if datetime_match else "14:00 15/09/2026"
+        advisor_match = re.search(r'"advisor"\s*:\s*"([^"]+)"', prompt)
+        advisor_name = advisor_match.group(1) if advisor_match else "PGS.TS Nguyễn Văn A"
         
         # Mô phỏng nhận diện intent gọi Tool
-        if "sv2026001" in prompt_lower and "đặt lịch" in prompt_lower:
+        if "observation" in prompt_lower and "đặt lịch" in prompt_lower:
             return {
                 "type": "tool_call",
                 "tool_name": "schedule_appointment",
-                "arguments": {"student_id": "SV2026001", "datetime_str": "14:00 15/09/2026", "advisor_name": "PGS.TS Nguyễn Văn A"},
-                "thought": "Người dùng yêu cầu đặt lịch hẹn tư vấn cho sinh viên SV2026001. Tôi sẽ gọi tool schedule_appointment."
+                "arguments": {"student_id": student_id, "datetime_str": datetime_str, "advisor_name": advisor_name},
+                "thought": f"Đã có thông tin cố vấn. Tôi sẽ gọi schedule_appointment cho {student_id}."
             }
-        elif "sv2026001" in prompt_lower or "tra cứu" in prompt_lower:
+        if "đặt lịch" in prompt_lower and "tra cứu" not in prompt_lower:
+            return {
+                "type": "tool_call",
+                "tool_name": "schedule_appointment",
+                "arguments": {"student_id": student_id, "datetime_str": datetime_str, "advisor_name": advisor_name},
+                "thought": f"Người dùng yêu cầu đặt lịch hẹn cho {student_id}."
+            }
+        elif student_match or "tra cứu" in prompt_lower:
             return {
                 "type": "tool_call",
                 "tool_name": "academic_query",
-                "arguments": {"student_id": "SV2026001"},
-                "thought": "Người dùng muốn tra cứu thông tin học vụ của sinh viên SV2026001. Tôi sẽ gọi tool academic_query."
+                "arguments": {"student_id": student_id},
+                "thought": f"Người dùng muốn tra cứu thông tin học vụ của {student_id}."
             }
         else:
             return {
@@ -65,6 +80,26 @@ class GeminiProvider(BaseLLMProvider):
     def __init__(self, api_key: str = None, model: str = None):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.model_name = model or os.getenv("LLM_MODEL") or "gemini-2.5-flash"
+        self.min_request_interval = float(os.getenv("GEMINI_MIN_REQUEST_INTERVAL", "35"))
+        self._last_request_time = 0.0
+
+    def _candidate_models(self) -> List[str]:
+        configured = os.getenv(
+            "GEMINI_FALLBACK_MODELS",
+            "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+        )
+        models = [self.model_name]
+        models.extend(model.strip() for model in configured.split(",") if model.strip())
+        return list(dict.fromkeys(models))
+
+    def _wait_for_rate_limit(self) -> None:
+        """Giãn các request để tránh vượt giới hạn RPM của Gemini free tier."""
+        elapsed = time.monotonic() - self._last_request_time
+        wait_seconds = self.min_request_interval - elapsed
+        if self._last_request_time and wait_seconds > 0:
+            print(f"⏳ [Gemini Rate Limit]: Chờ {wait_seconds:.1f}s trước request tiếp theo...")
+            time.sleep(wait_seconds)
+        self._last_request_time = time.monotonic()
 
     def generate(self, prompt: str, system_prompt: str = "") -> str:
         if not self.api_key or self.api_key == "your_gemini_api_key_here":
@@ -73,6 +108,7 @@ class GeminiProvider(BaseLLMProvider):
             from google import genai
             client = genai.Client(api_key=self.api_key)
             contents = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+            self._wait_for_rate_limit()
             response = client.models.generate_content(model=self.model_name, contents=contents)
             return response.text
         except Exception as e:
@@ -107,11 +143,30 @@ class GeminiProvider(BaseLLMProvider):
                 temperature=0.2
             )
 
-            response = client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config
-            )
+            response = None
+            last_error = None
+            selected_model = self.model_name
+            for candidate_model in self._candidate_models():
+                try:
+                    self._wait_for_rate_limit()
+                    response = client.models.generate_content(
+                        model=candidate_model,
+                        contents=prompt,
+                        config=config
+                    )
+                    selected_model = candidate_model
+                    if candidate_model != self.model_name:
+                        print(f"✅ [Gemini Model Fallback]: Đã dùng API thật qua '{candidate_model}'.")
+                    break
+                except Exception as model_error:
+                    last_error = model_error
+                    error_text = str(model_error)
+                    if "429" not in error_text and "503" not in error_text:
+                        raise
+                    print(f"⚠️ [Gemini Model Busy]: '{candidate_model}' trả lỗi; thử model API thật tiếp theo.")
+
+            if response is None:
+                raise last_error or RuntimeError("Không có Gemini model nào phản hồi thành công.")
 
             # Kiểm tra xem Gemini có trả về Tool Call không
             if response.function_calls:
@@ -121,18 +176,28 @@ class GeminiProvider(BaseLLMProvider):
                     "type": "tool_call",
                     "tool_name": call.name,
                     "arguments": args,
-                    "thought": f"Gemini quyết định gọi công cụ '{call.name}' với tham số: {json.dumps(args, ensure_ascii=False)}"
+                    "provider": "gemini",
+                    "model": selected_model,
+                    "thought": f"Gemini ({selected_model}) quyết định gọi công cụ '{call.name}' với tham số: {json.dumps(args, ensure_ascii=False)}"
                 }
             else:
                 return {
                     "type": "text",
                     "content": response.text or "",
-                    "thought": "Gemini phản hồi trực tiếp bằng văn bản (không cần gọi công cụ)."
+                    "provider": "gemini",
+                    "model": selected_model,
+                    "thought": f"Gemini ({selected_model}) phản hồi trực tiếp bằng văn bản (không cần gọi công cụ)."
                 }
 
         except Exception as e:
-            print(f"⚠️ [Gemini API Warning]: Không thể kết nối live API ({str(e)}). Tự động fallback về Mock.")
-            return MockOfflineProvider().generate_with_tools(prompt, tools_schema, system_prompt)
+            error_message = str(e)
+            print(f"❌ [Gemini API Error]: {error_message}")
+            return {
+                "type": "error",
+                "provider": "gemini",
+                "error": error_message,
+                "thought": "Gemini API không phản hồi thành công; không dùng Mock thay thế trong lượt nghiệm thu."
+            }
 
 
 class OpenAIProvider(BaseLLMProvider):

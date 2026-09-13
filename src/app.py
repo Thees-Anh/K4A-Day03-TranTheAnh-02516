@@ -71,6 +71,7 @@ def run_react_agent(user_query: str, provider, mcp_server: MCPAcademicServer) ->
     step = 0
     trace_logs = []
     tools_list = mcp_server.list_tools()
+    current_prompt = user_query
     
     while step < MAX_ITERATIONS:
         step += 1
@@ -78,7 +79,7 @@ def run_react_agent(user_query: str, provider, mcp_server: MCPAcademicServer) ->
         print(f"\n--- 🔄 Vòng lặp ReAct Loop (Step {step}/{MAX_ITERATIONS}) ---")
         
         # Gọi LLM với Native Tool Calling Specs
-        llm_response = provider.generate_with_tools(user_query, tools_list, system_prompt=REACT_AGENT_SYSTEM_PROMPT)
+        llm_response = provider.generate_with_tools(current_prompt, tools_list, system_prompt=REACT_AGENT_SYSTEM_PROMPT)
         latency_ms = round((time.time() - step_start_time) * 1000, 2)
         
         thought = llm_response.get("thought", "Đang suy luận...")
@@ -93,7 +94,22 @@ def run_react_agent(user_query: str, provider, mcp_server: MCPAcademicServer) ->
                 "query": user_query,
                 "action_type": "FINAL_ANSWER",
                 "thought": thought,
+                "provider": llm_response.get("provider", provider.__class__.__name__),
+                "model": llm_response.get("model", getattr(provider, "model_name", "unknown")),
                 "output": final_content,
+                "latency_ms": latency_ms
+            })
+            break
+
+        elif llm_response.get("type") == "error":
+            error_message = llm_response.get("error", "Lỗi LLM API không xác định.")
+            print(f"❌ [API ERROR]: {error_message}")
+            trace_logs.append({
+                "step": step,
+                "query": user_query,
+                "action_type": "API_ERROR",
+                "provider": llm_response.get("provider", "unknown"),
+                "error": error_message,
                 "latency_ms": latency_ms
             })
             break
@@ -139,11 +155,31 @@ def run_react_agent(user_query: str, provider, mcp_server: MCPAcademicServer) ->
                 "step": step,
                 "query": user_query,
                 "action_type": "TOOL_EXECUTION",
+                "thought": thought,
+                "provider": llm_response.get("provider", provider.__class__.__name__),
+                "model": llm_response.get("model", getattr(provider, "model_name", "unknown")),
                 "tool_name": tool_name,
                 "arguments": arguments,
                 "observation": obs_data,
                 "latency_ms": latency_ms
             })
+
+            needs_followup = (
+                tool_name == "academic_query"
+                and obs_data.get("status") == "SUCCESS"
+                and "đặt lịch" in user_query.lower()
+            )
+
+            if needs_followup:
+                current_prompt = (
+                    f"Yêu cầu ban đầu: {user_query}\n"
+                    f"Tool vừa gọi: {tool_name}\n"
+                    f"Observation: {json.dumps(obs_data, ensure_ascii=False)}\n"
+                    "Hãy tiếp tục mục tiêu còn lại. Dùng tên cố vấn trong Observation để gọi "
+                    "schedule_appointment với đúng mã sinh viên và thời gian trong yêu cầu ban đầu."
+                )
+                print("➡️ [ReAct Continue]: Cần thêm hành động đặt lịch sau bước tra cứu.")
+                continue
             
             # Kết thúc vòng lặp sau khi hoàn tất Observation và xuất Final Answer
             print(f"🧠 [Thought]: Đã nhận được dữ liệu từ MCP Server. Tổng hợp kết quả phản hồi.")
@@ -154,6 +190,8 @@ def run_react_agent(user_query: str, provider, mcp_server: MCPAcademicServer) ->
                 "query": user_query,
                 "action_type": "FINAL_ANSWER",
                 "thought": "Tổng hợp kết quả từ MCP Server thành công.",
+                "provider": llm_response.get("provider", provider.__class__.__name__),
+                "model": llm_response.get("model", getattr(provider, "model_name", "unknown")),
                 "output": final_answer,
                 "latency_ms": 10.0
             })
